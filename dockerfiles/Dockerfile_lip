@@ -1,0 +1,64 @@
+# Self-contained Lip core GPU image: pinned public repositories + bundled prior.
+# Build without local source: docker build -t lip:laidd - < Dockerfile_lip
+FROM condaforge/miniforge3:24.3.0-0
+
+ARG LIP_REPO=https://github.com/CONNECTS-SCV/Lip.git
+ARG LIP_REF=f6d9dcd538c7653793913cd2ab04f2a47b2dfb7a
+ARG REINVENT_REPO=https://github.com/MolecularAI/REINVENT4.git
+ARG REINVENT_REF=d1f0ae4307a875a16e05306908c6db114b256d2a
+ARG PRIOR_URL=https://zenodo.org/records/20701824/files/reinvent_pubchem.prior
+ARG PRIOR_MD5=75052d5e93b2470e9c6684d369704f5f
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_REQUIRE_VIRTUALENV=false \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONPATH=/opt/lip \
+    REINVENT_PRIOR_BASE=/opt/priors
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git wget ca-certificates openbabel \
+      build-essential swig libboost-all-dev libgomp1 libgl1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# REINVENT4 imports used by lip.engine are internal APIs; keep this revision fixed.
+RUN git clone "${REINVENT_REPO}" /opt/REINVENT4 \
+ && git -C /opt/REINVENT4 checkout "${REINVENT_REF}"
+RUN mamba create -y -n lip python=3.11 pip \
+ && mamba clean -afy
+SHELL ["conda", "run", "--no-capture-output", "-n", "lip", "/bin/bash", "-c"]
+
+# Match the pinned upstream torch requirement and use CUDA 12.6 wheels.
+RUN pip install --no-cache-dir "torch==2.12.0" torchvision \
+      --index-url https://download.pytorch.org/whl/cu126 \
+ && pip install --no-cache-dir /opt/REINVENT4 \
+      "vina==1.2.7" "meeko==0.6.1" "gemmi==0.7.1" \
+      "scipy>=1.15,<2" "toml==0.10.2" \
+ && pip check
+
+# A fixed record and checksum prevent silently changing the default prior.
+RUN mkdir -p /opt/priors \
+ && wget --progress=dot:giga --tries=5 --waitretry=60 \
+      --retry-on-http-error=429,502,503,504 \
+      -O /opt/priors/reinvent.prior "${PRIOR_URL}" \
+ && echo "${PRIOR_MD5}  /opt/priors/reinvent.prior" | md5sum -c -
+
+# Download Lip from its public repository; override LIP_REF to select a revision.
+# Lip currently has no pyproject.toml/setup.py, so expose it via PYTHONPATH.
+RUN git clone "${LIP_REPO}" /opt/lip \
+ && git -C /opt/lip checkout "${LIP_REF}"
+WORKDIR /opt/lip
+
+# Fail the build on import/API/prior/preparation problems without needing a GPU.
+RUN python -m lip --version \
+ && python -m lip run --help \
+ && python -c "import lip.runner, lip.engine, vina, meeko, gemmi; from lip.engine.assembly import build_context, build_learner; from reinvent.runmodes.create_adapter import create_adapter; import torch; adapter, _, kind = create_adapter('.reinvent', 'inference', torch.device('cpu')); assert kind == 'Reinvent', kind; from lip.scoring.docking import prepare_ligand_pdbqt; pdbqt, ok = prepare_ligand_pdbqt('CCO'); assert ok and 'ATOM' in pdbqt; print('Lip core checks passed')" \
+ && obabel -V
+
+# Interactive bash should activate the same environment as container commands.
+RUN echo "conda activate lip" >> /root/.bashrc \
+ && mkdir -p /results /data
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "lip"]
+CMD ["python", "-m", "lip", "--help"]

@@ -1,0 +1,68 @@
+# Self-contained RFdiffusion3 (RFD3) GPU image, following the Dockerfile_ab3 workflow.
+# Only RFD3 is installed: the `rfd3` extra and the RFD3 checkpoint. ProteinMPNN / RF3 weights are not included.
+# Build without any local context:  docker build -t rfd3:laidd - < Dockerfile_rfd3
+FROM condaforge/miniforge3:24.3.0-0
+
+# Pinned to a known commit (v0.2.0-19) for reproducible builds; override with --build-arg FOUNDRY_REF=<ref>.
+# RFD3 is part of the RosettaCommons/foundry monorepo (pip package "rc-foundry"); there is no standalone RFD3 repository.
+ARG FOUNDRY_REPO=https://github.com/RosettaCommons/foundry.git
+ARG FOUNDRY_REF=0932f1cb165ae7d413c11b1a7acc04ee31758817
+ARG RFD3_CKPT_URL=https://files.ipd.uw.edu/pub/rfd3/rfd3_foundry_2025_12_01_remapped.ckpt
+
+# The file name must stay rfd3_latest.ckpt: it is the name the checkpoint registry (REGISTERED_CHECKPOINTS["rfd3"])
+# looks up in FOUNDRY_CHECKPOINT_DIRS when the config says `ckpt_path: rfd3`.
+# FOUNDRY_CHECKPOINT_DIRS is outside /root so that mounting a volume on $HOME cannot hide the weights.
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_REQUIRE_VIRTUALENV=false \
+    FOUNDRY_CHECKPOINT_DIRS=/opt/rfd3_checkpoints \
+    PATH=/opt/conda/envs/rfd3/bin:${PATH}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git wget ca-certificates build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Weights first, so a failed download stops the build before the long pip step.
+RUN mkdir -p "${FOUNDRY_CHECKPOINT_DIRS}" \
+ && wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+      -O "${FOUNDRY_CHECKPOINT_DIRS}/rfd3_latest.ckpt" "${RFD3_CKPT_URL}"
+
+# 2) Source: no COPY or local repository build context is required.
+# The .git directory is kept because hatch-vcs derives the package version from it.
+RUN git clone "${FOUNDRY_REPO}" /opt/foundry \
+ && git -C /opt/foundry checkout --detach "${FOUNDRY_REF}"
+WORKDIR /opt/foundry
+
+# 3) Environment: pyproject.toml requires Python >=3.12.
+# ci-constraints.txt is the upstream-validated pin set (torch 2.7.1, rdkit 2025.3.6). Without it atomworks 2.2.1
+# no longer caps torch/rdkit and pip would resolve newer versions that upstream has not validated.
+# The default PyPI torch 2.7.1 Linux wheel is the CUDA 12.6 build and bundles its own CUDA libraries.
+# atomworks is pinned to 2.2.1 because pyproject.toml only says ">=2.1.1" and ci-constraints.txt does not cap it:
+# pip then resolves atomworks 3.x, which removed atomworks.io.utils.bonds.get_inferred_polymer_bonds that
+# rfd3/inference/input_parsing.py imports, so `rfd3 design` died with an ImportError (the earlier build still passed
+# its checks because `rfd3 --help` imports rfd3 lazily). Revisit when upstream moves RFD3 to atomworks 3.
+RUN mamba create -y -n rfd3 python=3.12 pip \
+ && mamba clean -afy
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN cp ci-constraints.txt /tmp/constraints.txt \
+ && echo "atomworks==2.2.1" >> /tmp/constraints.txt \
+ && pip install -c /tmp/constraints.txt ".[rfd3]"
+
+# 4) Build-time checks that need no GPU: the checkpoint registry finds the weights, the CLI starts,
+# the modules `rfd3 design` imports lazily really import, and torch is a CUDA build
+# (a CPU-only wheel would only fail at `docker run` time).
+RUN python -c "import torch; \
+from foundry.inference_engines.checkpoint_registry import REGISTERED_CHECKPOINTS; \
+ckpt = REGISTERED_CHECKPOINTS['rfd3'].get_default_path(); \
+assert ckpt.is_file() and ckpt.stat().st_size > 0, ckpt; \
+print('rfd3 checkpoint:', ckpt, ckpt.stat().st_size, 'bytes'); \
+print('torch:', torch.__version__, 'CUDA build:', torch.version.cuda); \
+assert torch.version.cuda is not None; \
+from rfd3.run_inference import run_inference" \
+ && rfd3 --help > /dev/null
+
+# 5) Container commands run in the repository (docs/examples use paths relative to it); results go to /results.
+RUN mkdir -p /results
+CMD ["python", "-c", "import torch, rfd3; print('rfd3 OK', 'torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'GPU available:', torch.cuda.is_available())"]

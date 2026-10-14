@@ -1,0 +1,86 @@
+# Self-contained FlowDock GPU image: clones the repo and downloads all inference weights at build time.
+# Build without any local context:  docker build -t flowdock:laidd - < Dockerfile_flowdock
+#
+# Inference only (flowdock/sample.py). Training-only assets are not included: the NeuralPLexer
+# warm-start weights (configs/sample.yaml sets every from_pretrained to false) and the
+# PDBBind/MOAD/DockGen/PLINDER datasets.
+FROM condaforge/miniforge3:24.3.0-0
+
+# Pinned to a known commit for reproducible builds; override with --build-arg FLOWDOCK_REF=<ref>.
+ARG FLOWDOCK_REPO=https://github.com/BioinfoMachineLearning/FlowDock.git
+ARG FLOWDOCK_REF=c233fd8be67f9c9d174f0db7f9e7b7ea613bbaf2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_REQUIRE_VIRTUALENV=false \
+    TORCH_HOME=/opt/torch
+
+# gcc/g++: openfold and pytorch3d are compiled from git during the pip step.
+# libxml2/libgl1: same runtime libraries as the upstream Dockerfile.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git wget ca-certificates build-essential libxml2 libgl1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Model repo
+RUN git clone "${FLOWDOCK_REPO}" /opt/flowdock \
+ && git -C /opt/flowdock checkout "${FLOWDOCK_REF}"
+WORKDIR /opt/flowdock
+
+# 2) Conda part of environments/flowdock_environment_docker.yaml (everything above its `- pip:` block).
+# The pip block is installed separately in step 3 because it needs different pip flags.
+RUN sed '/^  - pip:/,$d' environments/flowdock_environment_docker.yaml > /tmp/flowdock_conda.yaml \
+ && mamba env create -n flowdock -f /tmp/flowdock_conda.yaml \
+ && mamba clean -afy \
+ && rm /tmp/flowdock_conda.yaml
+SHELL ["conda", "run", "--no-capture-output", "-n", "flowdock", "/bin/bash", "-c"]
+
+# 3) Pip part of the same yaml, then the README steps (`pip install -e .`, ProDy without its NumPy pin).
+# openfold and pytorch3d import torch in setup.py, so they must see the env's torch: current pip only
+# does isolated PEP 517 builds unless --no-build-isolation is given, which `conda env create` cannot pass.
+# setuptools is pinned below 70 because torch 2.2's cpp_extension still imports pkg_resources.packaging.
+# No nvcc in this image, so both build their CPU fallbacks; FlowDock only uses their pure-PyTorch paths.
+RUN sed -n '/^  - pip:/,$p' environments/flowdock_environment_docker.yaml \
+      | sed -n 's/^      - //p' > /tmp/flowdock_pip.txt \
+ && pip install --no-cache-dir "setuptools==69.5.1" "wheel==0.43.0" \
+ && pip install --no-cache-dir --no-build-isolation -r /tmp/flowdock_pip.txt \
+ && pip install --no-cache-dir --no-build-isolation --no-deps -e . \
+ && pip install --no-cache-dir --no-build-isolation --no-deps "prody==2.4.1" \
+ && rm /tmp/flowdock_pip.txt
+
+# 4) FlowDock weights (README "pretrained FlowDock weights" step); extracts to checkpoints/ in the repo root.
+RUN wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+      -O /tmp/flowdock_checkpoints.tar.gz https://zenodo.org/records/15066450/files/flowdock_checkpoints.tar.gz \
+ && tar -xzf /tmp/flowdock_checkpoints.tar.gz -C /opt/flowdock \
+ && rm /tmp/flowdock_checkpoints.tar.gz \
+ && test -f checkpoints/esmfold_prior_paper_weights-EMA.ckpt
+
+# 5) ESM weights that on_predict_start fetches through torch.hub, pre-placed in $TORCH_HOME/hub/checkpoints
+# so the container runs with --network none:
+#   - esm2_t33_650M_UR50D: protein encoder embeddings (always loaded)
+#   - esmfold_3B_v1 + esm2_t36_3B_UR50D (its language-model trunk): apo structure prior, loaded unless a
+#     single input comes with input_template (CSV/batched inputs always load it)
+RUN mkdir -p "${TORCH_HOME}/hub/checkpoints" \
+ && cd "${TORCH_HOME}/hub/checkpoints" \
+ && for url in \
+      https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t33_650M_UR50D.pt \
+      https://dl.fbaipublicfiles.com/fair-esm/regression/esm2_t33_650M_UR50D-contact-regression.pt \
+      https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t36_3B_UR50D.pt \
+      https://dl.fbaipublicfiles.com/fair-esm/regression/esm2_t36_3B_UR50D-contact-regression.pt \
+      https://dl.fbaipublicfiles.com/fair-esm/models/esmfold_3B_v1.pt; do \
+      wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 "${url}" || exit 1; \
+    done
+
+# 6) Smoke test: the modules sample.py imports load, and ESM2 loads from the local torch.hub cache
+# (same cache directory the ESMFold weights use). The build has network access, so a wrong cache path
+# would silently re-download; the file count check fails the build in that case. ESMFold itself
+# (~3B params) is not loaded here to keep build memory low; the CSV example at `docker run` time covers it.
+RUN python -c "import torch, esm, openfold, pytorch3d, prody; \
+from flowdock.models.flowdock_fm_module import FlowDockFMLitModule; \
+esm.pretrained.load_model_and_alphabet_hub('esm2_t33_650M_UR50D'); \
+print('torch', torch.__version__, 'esm OK')" \
+ && test "$(ls "${TORCH_HOME}/hub/checkpoints" | wc -l)" -eq 5
+
+# Interactive `bash` sources .bashrc, which activates base; switch to the model env instead.
+RUN echo "conda activate flowdock" >> /root/.bashrc
+
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "flowdock"]
+CMD ["python", "-c", "import flowdock, torch; print(torch.__version__, torch.cuda.is_available())"]

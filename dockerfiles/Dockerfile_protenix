@@ -1,0 +1,88 @@
+# Self-contained Protenix GPU image, following the Dockerfile_ab3 workflow.
+# Repository, Python dependencies, weights (protenix_base_20250630_v1.0.0) and CCD/data caches are included.
+# Build without any local context:  docker build -t protenix:laidd - < Dockerfile_protenix
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+
+# Conda only provides Python 3.11 (setup.py requires >=3.11); the CUDA toolkit (nvcc) comes from
+# the devel base image, which Protenix needs to JIT-compile its fast_layernorm kernel.
+COPY --from=condaforge/miniforge3:24.3.0-0 /opt/conda /opt/conda
+
+# Pinned to a known commit for reproducible builds; override with --build-arg PROTENIX_REF=<ref>.
+ARG PROTENIX_REPO=https://github.com/bytedance/Protenix.git
+ARG PROTENIX_REF=4c355be4553512f72453ecbfb65e69f4c35d1413
+ARG PROTENIX_STORAGE_URL=https://protenix.tos-cn-beijing.volces.com
+ARG CUTLASS_REF=v3.5.1
+# Space-separated checkpoints baked into the image; each must be a key in protenix/web_service/dependency_url.py.
+# - protenix_base_default_v1.0.0: the `protenix pred` default (-n omitted); 2021-09-30 data cutoff, for fair benchmarks.
+# - protenix_base_20250630_v1.0.0: same architecture, 2025-06-30 cutoff; upstream recommends it for practical use.
+# protenix-v2 is not included: its weights are not publicly downloadable.
+ARG PROTENIX_MODELS="protenix_base_default_v1.0.0 protenix_base_20250630_v1.0.0"
+
+# PROTENIX_ROOT_DIR is outside /root so that mounting a volume on $HOME cannot hide the weights.
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_REQUIRE_VIRTUALENV=false \
+    PROTENIX_ROOT_DIR=/opt/protenix_data \
+    PROTENIX_MODELS="${PROTENIX_MODELS}" \
+    CUDA_HOME=/usr/local/cuda \
+    CUTLASS_PATH=/opt/cutlass \
+    PATH=/opt/conda/envs/protenix/bin:${PATH}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      git wget ca-certificates build-essential hmmer kalign \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Weights and data caches first, so a failed download stops the build before the long pip step.
+# Same files and locations as runner/inference.py download_inference_cache() (URLs: dependency_url.py).
+RUN mkdir -p "${PROTENIX_ROOT_DIR}/checkpoint" "${PROTENIX_ROOT_DIR}/common" \
+ && for m in ${PROTENIX_MODELS}; do \
+      wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+        -O "${PROTENIX_ROOT_DIR}/checkpoint/${m}.pt" "${PROTENIX_STORAGE_URL}/checkpoint/${m}.pt" || exit 1; \
+    done \
+ && for f in components.cif components.cif.rdkit_mol.pkl clusters-by-entity-40.txt obsolete_release_date.csv; do \
+      wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+        -O "${PROTENIX_ROOT_DIR}/common/${f}" "${PROTENIX_STORAGE_URL}/common/${f}" || exit 1; \
+    done
+
+# 2) Source: no COPY or local repository build context is required.
+RUN git clone "${PROTENIX_REPO}" /opt/Protenix \
+ && git -C /opt/Protenix checkout --detach "${PROTENIX_REF}"
+WORKDIR /opt/Protenix
+
+# 3) Environment: same steps as the upstream Dockerfile (requirements.txt pins torch 2.7.1 / CUDA 12.6).
+# ninja is required by torch.utils.cpp_extension for the layernorm kernel build below.
+RUN /opt/conda/bin/mamba create -y -n protenix python=3.11 pip \
+ && /opt/conda/bin/mamba clean -afy
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN pip install -r requirements.txt ninja \
+ && pip install --no-deps -e .
+
+# 4) CUTLASS for the optional DeepSpeed (ds4sci) triangle attention kernel, as in upstream Dockerfile.
+RUN git clone --depth 1 -b "${CUTLASS_REF}" https://github.com/NVIDIA/cutlass.git "${CUTLASS_PATH}"
+
+# 5) Pre-compile the fast_layernorm CUDA kernel (default LAYERNORM_TYPE). Otherwise every `docker run --rm`
+# would JIT-compile it again. nvcc does not need a GPU; archs are picked from nvcc by torch_ext_compile.py.
+RUN python -c "import protenix.model.layer_norm.layer_norm as m; print('fast_layer_norm_cuda_v2:', m.fast_layer_norm_cuda_v2.__file__)"
+
+# 6) Build-time checks that need no GPU: weights load and carry the "model" key that load_checkpoint() reads,
+# every data file exists where configs_data.py expects it, and the binaries used by MSA/template code are on PATH.
+RUN python -c "import os, shutil, torch; \
+root = os.environ['PROTENIX_ROOT_DIR']; \
+from configs.configs_data import data_configs; \
+paths = [data_configs[k] for k in ('ccd_components_file', 'ccd_components_rdkit_mol_file', 'pdb_cluster_file', 'obsolete_release_data_csv')]; \
+missing = [p for p in paths if not (os.path.isfile(p) and os.path.getsize(p) > 0)]; \
+assert not missing, missing; \
+assert all(shutil.which(b) for b in ('kalign', 'hmmsearch', 'hmmbuild')); \
+print('torch:', torch.__version__, 'CUDA build:', torch.version.cuda); \
+assert torch.version.cuda is not None; \
+sizes = {n: len(torch.load(os.path.join(root, 'checkpoint', n + '.pt'), map_location='cpu', weights_only=False)['model']) for n in os.environ['PROTENIX_MODELS'].split()}; \
+assert sizes and all(sizes.values()), sizes; \
+print('checkpoint tensors:', sizes)" \
+ && protenix pred --help > /dev/null
+
+# 7) Container commands run in the Protenix repo (examples/ use paths relative to it); results go to /results.
+RUN mkdir -p /results
+CMD ["python", "-c", "import torch; from protenix.version import __version__; print('protenix', __version__, 'torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'GPU available:', torch.cuda.is_available())"]

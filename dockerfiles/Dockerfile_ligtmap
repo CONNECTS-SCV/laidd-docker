@@ -1,0 +1,340 @@
+# Self-contained LigTMap CPU image: pinned public repository + python2.7 conda env + PSOVina + MGLTools.
+# Build without local source: docker build -t ligtmap:laidd - < Dockerfile_ligtmap
+FROM condaforge/miniforge3:24.3.0-0
+
+ARG LIGTMAP_REPO=https://github.com/ShirleyWISiu/LigTMap.git
+ARG LIGTMAP_REF=67201fd2300469bc2c56fec80aa06eff7538c22d
+# Prebuilt Ubuntu-15.04 binary; checksum guards against a mirror serving an HTML page.
+ARG PSOVINA_URL=https://sourceforge.net/projects/psovina/files/psovina-2.0.tar.gz/download
+ARG PSOVINA_SHA256=277ea73cd0dfaecef092ecf584d833d8b243d0fc60fb7ebf257de9281301902e
+# The upstream README link (code.google.com) is gone; this is the Google Code archive copy of pychem-1.0.
+# PyPI "pychem" is a different package and must not be used.
+ARG PYCHEM_URL=https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/pychem/pychem-1.0.tar.gz
+ARG PYCHEM_SHA256=52ef966e0983dc7049e22a688e4fa4617d6fd6840f5f12005819a80cb86595eb
+# ODDT 0.6 sdist from PyPI (sha256 from the PyPI release page); installed without pip, see step 3.
+ARG ODDT_URL=https://files.pythonhosted.org/packages/82/2b/35c38c89e2746b0a465d0aafcba87dbd10dcf854df28694f8a24920e1941/oddt-0.6.tar.gz
+ARG ODDT_SHA256=050a78dd623723caccc0a42d67fe5efae6d9e8d491a210bb13eb7e38822fe0d2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_REQUIRE_VIRTUALENV=false \
+    PYTHONUNBUFFERED=1 \
+    PYTHONWARNINGS=ignore::FutureWarning \
+    CONDA_CHANNEL_PRIORITY=flexible \
+    LIGTMAP=/opt/LigTMap \
+    MGLTools=/opt/conda/envs/mgltools
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git wget ca-certificates unzip bzip2 \
+      libgomp1 libxrender1 libxext6 \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Python 2.7 env, conda-forge only. README pins scipy 1.1.0 / pandas 0.23.4 are kept; scikit-learn is NOT the
+# README's 0.19.2: the pickled models were saved by sklearn 0.19.2 (15 models), 0.20.0 (Kinase) and 0.20.1
+# (Beta_secretase), and 0.19.2 cannot predict with the 0.20.x ones (n_jobs=None -> TypeError). 0.20.1 loads all of them.
+# conda-forge scikit-learn 0.20.1 needs openblas 0.3.3, so scipy uses its _1202 build (same 1.1.0, openblas 0.3.3,
+# libgfortran-ng 7). The older scipy _201 build only declares `libgfortran >=3.0` and then fails to import with
+# libgfortran.so.3 missing (real build log).
+# rdkit: the README's 2016.03.4 is not an installable conda package, rmg's 2015.03.1 lacks
+# rdkit.Chem.AtomPairs.Sheridan (imported by ligtmap.py) and rmg's 2015.09.2 needs numpy 1.10, which
+# the sklearn/scipy builds cannot use. conda-forge 2018.09.3 satisfies all of them.
+# openbabel 2.4.1 is required because pychem and oddt 0.6 do a top-level `import pybel`.
+RUN conda create -y -n ligtmap --override-channels -c conda-forge \
+      python=2.7 rdkit=2018.09.3 openbabel=2.4.1 numpy=1.16.5 \
+      scikit-learn=0.20.1 'scipy=1.1.0=py27_blas_openblas*_1202' pandas=0.23.4 six joblib \
+ && conda create -y -n mgltools --override-channels -c bioconda mgltools=1.5.7 \
+ && conda clean -afy
+
+# 1b) bioconda MGLTools 1.5.7 prepare_ligand4.py opens only os.path.basename() of -l, i.e. relative to the cwd.
+# ligtmap.py passes -l Output/Input_xxxxx/<class>/input.pdb from the job directory, so every target would Fail at
+# step 2. Restore the original line, which MGLTools left commented out right above it, instead of editing
+# ligtmap.py: ligtmap.py keeps its upstream arguments (docking results unchanged).
+RUN f="${MGLTools}/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_ligand4.py" \
+ && test "$(grep -c '^ *ligand_filename = os.path.basename(a)$' "$f")" = 1 \
+ && sed -i 's/^\( *\)ligand_filename = os.path.basename(a)$/\1ligand_filename = a/' "$f" \
+ && grep -q '^ *ligand_filename = a$' "$f"
+
+# 2) PSOVina docking binary (README step 9 builds from source against boost 1.59; the shipped binary avoids that).
+RUN wget --progress=dot:giga --tries=5 --waitretry=30 -O /tmp/psovina.tar.gz "${PSOVINA_URL}" \
+ && echo "${PSOVINA_SHA256}  /tmp/psovina.tar.gz" | sha256sum -c - \
+ && mkdir -p /opt/psovina-2.0 \
+ && tar -xzf /tmp/psovina.tar.gz -C /opt/psovina-2.0 --strip-components=3 psovina-2.0/binary/Ubuntu-15.04 \
+ && chmod +x /opt/psovina-2.0/psovina /opt/psovina-2.0/psovina_split \
+ && ln -s /opt/psovina-2.0/psovina /usr/local/bin/psovina \
+ && rm /tmp/psovina.tar.gz
+
+SHELL ["conda", "run", "--no-capture-output", "-n", "ligtmap", "/bin/bash", "-c"]
+
+# 3) PyChem 1.0 and ODDT 0.6 via setup.py. pip is not used: the conda py2.7 env's bin/pip fails with
+# "No module named pip._internal.cli.main" (seen in a real build, also with pip listed explicitly).
+# --single-version-externally-managed skips the egg install, so setuptools never tries to fetch ODDT's
+# install_requires (numpydoc etc.) from the network; all real dependencies are already conda-pinned above.
+RUN wget --progress=dot:giga --tries=5 --waitretry=30 -O /tmp/pychem.tar.gz "${PYCHEM_URL}" \
+ && echo "${PYCHEM_SHA256}  /tmp/pychem.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/pychem.tar.gz -C /tmp \
+ && cd /tmp/pychem-1.0 && python setup.py install \
+ && cd / && rm -rf /tmp/pychem.tar.gz /tmp/pychem-1.0
+RUN wget --progress=dot:giga --tries=5 --waitretry=30 -O /tmp/oddt.tar.gz "${ODDT_URL}" \
+ && echo "${ODDT_SHA256}  /tmp/oddt.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/oddt.tar.gz -C /tmp \
+ && cd /tmp/oddt-0.6 && python setup.py install --single-version-externally-managed --record /tmp/oddt.files \
+ && cd / && rm -rf /tmp/oddt.tar.gz /tmp/oddt-0.6 /tmp/oddt.files
+
+# 4) Model repo at a pinned commit (shallow fetch of the exact sha).
+RUN git init "${LIGTMAP}" \
+ && git -C "${LIGTMAP}" remote add origin "${LIGTMAP_REPO}" \
+ && git -C "${LIGTMAP}" fetch --depth 1 origin "${LIGTMAP_REF}" \
+ && git -C "${LIGTMAP}" checkout --detach FETCH_HEAD \
+ && rm -rf "${LIGTMAP}/.git"
+WORKDIR /opt/LigTMap
+
+# predict unzips Kinase.sav.zip on first use; do it at build time so a read-only or non-root run works.
+RUN cd Model && unzip -q Kinase.sav.zip && rm Kinase.sav.zip && test -s Kinase.sav \
+ && cd .. && chmod +x predict docking_files/*.sh
+
+# 5) Rdkit warmup at the top of ligtmap.py. Upstream imports openbabel/pybel/oddt first, which corrupts rdkit's
+# Boost state and makes the later FingerprintMol (Step 3) segfault (seen on Kinase, exit 139).
+# ligtmap.py has no encoding declaration (python2), so the inserted text must stay ASCII.
+RUN printf '%s\n' \
+      '' \
+      '# rdkit Boost warmup: importing openbabel/pybel/oddt inside main_part() below' \
+      '# corrupts rdkit Boost C++ global state, making the later rdkit FingerprintMol' \
+      '# (EState) call segfault (only on targets with a hit that reach Step 3, e.g. Kinase).' \
+      '# Calling rdkit here first, before any openbabel-family import, pins rdkit Boost' \
+      '# state and prevents the segfault. Keep ASCII only (this file has no encoding decl).' \
+      'from rdkit import Chem as _rkChem' \
+      'from rdkit.Chem.EState.Fingerprinter import FingerprintMol as _rkFP' \
+      "_rkFP(_rkChem.MolFromSmiles('CCO'))" \
+      > /tmp/rdkit_warmup.py \
+ && test "$(grep -c '^import sys$' ligtmap.py)" = 1 \
+ && sed -i '/^import sys$/r /tmp/rdkit_warmup.py' ligtmap.py \
+ && rm /tmp/rdkit_warmup.py \
+ && grep -q '^_rkFP(' ligtmap.py \
+ && ! grep -nP '[^\x00-\x7F]' ligtmap.py \
+ && python -m py_compile ligtmap.py && rm -f ligtmap.pyc
+
+# 6) Self-check script. It runs every check and reports all failures at once (one failure never hides the next).
+# Each check prints [RUN ] before it starts, so a crash such as a segfault still shows which check caused it.
+# Ligand preparation uses ligtmap.py's exact command line from a job directory, and docking runs the bundled
+# dock.sh -> run_vina.sh -> collect_score.sh on one target (10gs), followed by the step 4 IFP comparison.
+RUN printf '%s\n' \
+      'from __future__ import print_function' \
+      'import os' \
+      'import pickle' \
+      'import shutil' \
+      'import subprocess' \
+      'import sys' \
+      'import tempfile' \
+      'import warnings' \
+      '' \
+      'LIGTMAP = os.environ.get("LIGTMAP", "/opt/LigTMap")' \
+      'MGLTOOLS = os.environ.get("MGLTools", "/opt/conda/envs/mgltools")' \
+      'TEST_SMILES = "CCOc1ccccc1"' \
+      'FAILURES = []' \
+      'TARGETS = []' \
+      '' \
+      '' \
+      'def check(name, func):' \
+      '    print("[RUN ] " + name)' \
+      '    try:' \
+      '        detail = func()' \
+      '    except Exception as error:' \
+      '        FAILURES.append(name)' \
+      '        print("[FAIL] %s: %s: %s" % (name, type(error).__name__, error))' \
+      '        return' \
+      '    print("[PASS] %s%s" % (name, " -> %s" % detail if detail else ""))' \
+      '' \
+      '' \
+      'def run_command(command, cwd=None):' \
+      '    process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)' \
+      '    output = process.communicate()[0]' \
+      '    if not isinstance(output, str):' \
+      '        output = output.decode("utf-8", "replace")' \
+      '    return process.returncode, output' \
+      '' \
+      '' \
+      'def check_imports():' \
+      '    # Same order as ligtmap.py: rdkit warmup first, then the openbabel family.' \
+      '    from rdkit import Chem, rdBase' \
+      '    from rdkit.Chem.EState.Fingerprinter import FingerprintMol' \
+      '    FingerprintMol(Chem.MolFromSmiles("CCO"))' \
+      '    import numpy' \
+      '    import openbabel, pybel, pychem, oddt' \
+      '    from pychem import pychem as pychem_core, fingerprint' \
+      '    from oddt import toolkit, shape, fingerprints, interactions' \
+      '    from oddt.interactions import pi_stacking, hbond_acceptor_donor, hbonds, salt_bridge_plus_minus' \
+      '    from oddt.interactions import hydrophobic_contacts, acceptor_metal, close_contacts' \
+      '    from rdkit.Chem import AllChem, ChemicalFeatures, Draw' \
+      '    from rdkit.Chem.Pharm2D import Gobbi_Pharm2D, Generate' \
+      '    from rdkit.Chem.AtomPairs.Sheridan import GetBPFingerprint' \
+      '    from rdkit.Avalon.pyAvalonTools import GetAvalonFP' \
+      '    from rdkit.Chem.AllChem import GetMorganFingerprintAsBitVect, GetErGFingerprint' \
+      '    from rdkit.Chem.rdMolDescriptors import GetHashedAtomPairFingerprintAsBitVect' \
+      '    from rdkit.Chem.rdMolDescriptors import GetHashedTopologicalTorsionFingerprintAsBitVect' \
+      '    from rdkit.DataStructs.cDataStructs import ConvertToNumpyArray' \
+      '    import scipy, scipy.linalg, sklearn, pandas' \
+      '    if oddt.toolkit is None:' \
+      '        raise RuntimeError("oddt found no toolkit (openbabel/rdkit import failed inside oddt)")' \
+      '    return "rdkit %s numpy %s scipy %s sklearn %s pandas %s oddt toolkit %s" % (' \
+      '        rdBase.rdkitVersion, numpy.__version__, scipy.__version__, sklearn.__version__,' \
+      '        pandas.__version__, getattr(oddt.toolkit, "backend", "unknown"))' \
+      '' \
+      '' \
+      'def check_step1_fingerprints():' \
+      '    from pychem import pychem as pychem_core, fingerprint' \
+      '    molecule = pychem_core.Chem.MolFromSmiles(TEST_SMILES)' \
+      '    fingerprint.CalculateMorganFingerprint(molecule, radius=2)' \
+      '    fingerprint.CalculateMACCSFingerprint(molecule)' \
+      '    fingerprint.CalculateDaylightFingerprint(molecule)' \
+      '' \
+      '' \
+      'def check_step3_fingerprint_after_oddt():' \
+      '    # Step 3 of ligtmap.py segfaulted here when oddt was imported before rdkit was warmed up.' \
+      '    from rdkit import Chem' \
+      '    from rdkit.Chem.EState.Fingerprinter import FingerprintMol' \
+      '    return "%d features" % len(FingerprintMol(Chem.MolFromSmiles(TEST_SMILES))[0])' \
+      '' \
+      '' \
+      'def read_targets():' \
+      '    with open(os.path.join(LIGTMAP, "target.lst")) as handle:' \
+      '        TARGETS.extend(handle.read().split())' \
+      '    if len(TARGETS) != 17:' \
+      '        raise RuntimeError("expected 17 target classes in target.lst, got %d" % len(TARGETS))' \
+      '    return "%d classes" % len(TARGETS)' \
+      '' \
+      '' \
+      'def model_check(target):' \
+      '    def run():' \
+      '        import numpy' \
+      '        from rdkit import Chem' \
+      '        from rdkit.Chem.EState.Fingerprinter import FingerprintMol' \
+      '        features = numpy.array([FingerprintMol(Chem.MolFromSmiles(TEST_SMILES))[0]])' \
+      '        model_path = os.path.join(LIGTMAP, "Model", target + ".sav")' \
+      '        with warnings.catch_warnings():' \
+      '            # Models were pickled by sklearn 0.19.2 / 0.20.x; the version warning is expected.' \
+      '            warnings.simplefilter("ignore")' \
+      '            with open(model_path, "rb") as handle:' \
+      '                model = pickle.load(handle)' \
+      '            value = model.predict(features)[0]' \
+      '        return "predict %.3f" % value' \
+      '    return run' \
+      '' \
+      '' \
+      'def check_obabel():' \
+      '    code, output = run_command(["obabel", "-V"])' \
+      '    if code != 0:' \
+      '        raise RuntimeError("obabel -V exit %d: %s" % (code, output.strip()))' \
+      '    return output.strip()' \
+      '' \
+      '' \
+      'def in_temp_dir(func):' \
+      '    def run():' \
+      '        job_dir = tempfile.mkdtemp()' \
+      '        try:' \
+      '            return func(job_dir)' \
+      '        finally:' \
+      '            shutil.rmtree(job_dir, ignore_errors=True)' \
+      '    return run' \
+      '' \
+      '' \
+      'def run_like_ligtmap(command_line, job_dir):' \
+      '    # ligtmap.py runs its tools with command.split() from the job directory: no shell, no cwd change.' \
+      '    code, output = run_command(command_line.split(), cwd=job_dir)' \
+      '    if code != 0:' \
+      '        raise RuntimeError("%s exit %d: %s" % (command_line.split()[0], code, output.strip()[-400:]))' \
+      '' \
+      '' \
+      'def prepare_ligand_like_ligtmap(job_dir, output_path):' \
+      '    # Built exactly like ligtmap.py step 2, including the literal quotes around the -A / -U values.' \
+      '    quote = chr(39)' \
+      '    os.makedirs(os.path.join(job_dir, output_path))' \
+      '    run_like_ligtmap("obabel -:" + TEST_SMILES + " -opdb -O " + output_path + "/input.pdb --gen3d ", job_dir)' \
+      '    run_like_ligtmap(' \
+      '        MGLTOOLS + "/bin/pythonsh " + MGLTOOLS + "/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_ligand4.py"' \
+      '        + " -l " + output_path + "/input.pdb -o " + output_path + "/input.pdbqt"' \
+      '        + " -A " + quote + "hydrogens" + quote + " -U " + quote + "nphs_lps_waters" + quote, job_dir)' \
+      '    with open(os.path.join(job_dir, output_path, "input.pdbqt")) as handle:' \
+      '        lines = handle.read().splitlines()' \
+      '    # obabel writes small molecules as HETATM and MGLTools keeps that record name; vina reads ATOM and HETATM.' \
+      '    atom_count = len([line for line in lines if line.startswith("ATOM") or line.startswith("HETATM")])' \
+      '    if atom_count == 0 or not [line for line in lines if line.startswith("TORSDOF")]:' \
+      '        raise RuntimeError("input.pdbqt is not a ligand pdbqt (%d atoms), head: %s" % (atom_count, " | ".join(lines[:5])))' \
+      '    return atom_count' \
+      '' \
+      '' \
+      'def check_ligand_preparation(job_dir):' \
+      '    return "%d ligand atoms" % prepare_ligand_like_ligtmap(job_dir, "Output/Input_00000/Check")' \
+      '' \
+      '' \
+      'def read_tail(path, size):' \
+      '    if not os.path.isfile(path):' \
+      '        return "(missing %s)" % path' \
+      '    with open(path) as handle:' \
+      '        return handle.read().strip()[-size:]' \
+      '' \
+      '' \
+      'def check_docking_and_ifp(job_dir):' \
+      '    # Steps 2 and 4 of ligtmap.py for one bundled target (10gs, Transferase) through the real docking scripts.' \
+      '    import numpy' \
+      '    import oddt' \
+      '    from oddt import fingerprints' \
+      '    rootpa = LIGTMAP + "/"' \
+      '    output_path = "Output/Input_00000/Transferase"' \
+      '    prepare_ligand_like_ligtmap(job_dir, output_path)' \
+      '    with open(os.path.join(job_dir, output_path, "file_list"), "w") as handle:' \
+      '        print("10gs", file=handle)' \
+      '    run_like_ligtmap(rootpa + "docking_files/dock.sh pso " + output_path + " 1 1 " + rootpa, job_dir)' \
+      '    dock_log = os.path.join(job_dir, output_path, "DOCK_LOG")' \
+      '    with open(os.path.join(dock_log, "score_1.dat")) as handle:' \
+      '        score = handle.readline().strip()' \
+      '    pose_path = os.path.join(dock_log, "10gs", "10gs_ligand_1.pdb")' \
+      '    if not score or not os.path.isfile(pose_path):' \
+      '        raise RuntimeError("no docking result (score=%r), run_1.log: %s" % (' \
+      '            score, read_tail(os.path.join(dock_log, "10gs", "run_1.log"), 400)))' \
+      '    protein = next(oddt.toolkit.readfile("pdb", rootpa + "docking_files/protein/10gs_protein.pdb"))' \
+      '    protein.protein = True' \
+      '    ligand = next(oddt.toolkit.readfile("pdb", pose_path))' \
+      '    ifp = fingerprints.InteractionFingerprint(ligand, protein)' \
+      '    crystal_ifp = numpy.fromfile(rootpa + "Index/IFP/Transferase/10gs.bin", dtype=numpy.uint8)' \
+      '    if len(ifp) != len(crystal_ifp):' \
+      '        # ligtmap.py step 4 combines both arrays element-wise; a length mismatch makes the target Fail.' \
+      '        raise RuntimeError("IFP length %d differs from bundled crystal IFP length %d" % (len(ifp), len(crystal_ifp)))' \
+      '    return "docking score %s kcal/mol, IFP %d bits set" % (score, int(numpy.count_nonzero(ifp)))' \
+      '' \
+      '' \
+      'def check_psovina():' \
+      '    # psovina is a static binary; accept exit 0 or 1 for --help and require the usage text.' \
+      '    code, output = run_command(["psovina", "--help"])' \
+      '    if code not in (0, 1) or "receptor" not in output.lower():' \
+      '        raise RuntimeError("psovina --help exit %d, output: %s" % (code, output.strip()[:200]))' \
+      '' \
+      '' \
+      'check("imports in ligtmap.py order", check_imports)' \
+      'check("step 1 pychem fingerprints", check_step1_fingerprints)' \
+      'check("step 3 FingerprintMol after oddt import", check_step3_fingerprint_after_oddt)' \
+      'check("target.lst", read_targets)' \
+      'for model_target in TARGETS:' \
+      '    check("model " + model_target, model_check(model_target))' \
+      'check("obabel", check_obabel)' \
+      'check("obabel -> MGLTools prepare_ligand4 (ligtmap.py command line)", in_temp_dir(check_ligand_preparation))' \
+      'check("psovina", check_psovina)' \
+      'check("docking 10gs via dock.sh + IFP (steps 2 and 4)", in_temp_dir(check_docking_and_ifp))' \
+      '' \
+      'print("")' \
+      'if FAILURES:' \
+      '    print("SELFCHECK FAILED (%d): %s" % (len(FAILURES), ", ".join(FAILURES)))' \
+      '    sys.exit(1)' \
+      'print("LigTMap env check passed")' \
+      > /opt/ligtmap_selfcheck.py
+
+# The check runs at build time and fails the build. To keep the image anyway and debug inside it, rebuild with
+#   --build-arg SELFCHECK_STRICT=false   then   docker run --rm -it --entrypoint bash ligtmap:laidd
+# ARG is declared here so the layers above stay cached when it changes.
+ARG SELFCHECK_STRICT=true
+RUN python /opt/ligtmap_selfcheck.py || [ "${SELFCHECK_STRICT}" = "false" ]
+
+# Interactive bash should activate the same environment as container commands.
+RUN echo "conda activate ligtmap" >> /root/.bashrc \
+ && mkdir -p /work
+WORKDIR /work
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "ligtmap"]
+CMD ["python", "/opt/ligtmap_selfcheck.py"]

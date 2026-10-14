@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1.7
+# Self-contained ADMET-AI v2 image; code, model weights, and reference data are included.
+# Linux/Bash: docker build -t admet_ai:laidd - < Dockerfile_admet_ai
+FROM condaforge/miniforge3:24.3.0-0
+
+# Match the current project checkout. Override only with a compatible ADMET-AI v2 ref.
+ARG ADMET_AI_REPO=https://github.com/swansonk14/admet_ai.git
+ARG ADMET_AI_REF=c65bf0418e19c65d7228f9e40da5d0152aade756
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_REQUIRE_VIRTUALENV=false \
+    PYTHONUNBUFFERED=1 \
+    MPLBACKEND=Agg
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates libxrender1 libxext6 libsm6 libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Fetch source. This commit tracks all 10 .pt weights and DrugBank reference CSVs in Git.
+RUN git clone "${ADMET_AI_REPO}" /opt/admet_ai \
+ && git -C /opt/admet_ai checkout --detach "${ADMET_AI_REF}"
+WORKDIR /opt/admet_ai
+
+# 2) Use Python 3.12 for the upstream frozen dependency versions.
+RUN mamba create -y -n admet_ai -c conda-forge python=3.12 pip \
+ && mamba clean -afy
+SHELL ["conda", "run", "--no-capture-output", "-n", "admet_ai", "/bin/bash", "-c"]
+
+# Upstream freeze includes an SSH editable install and a machine-local packaging URL.
+# Keep portable version pins as constraints; install only inference/web dependencies.
+# setuptools>=82 is required by pyproject.toml, replacing the stale frozen 80.10.2 pin.
+RUN python - <<'PY'
+from pathlib import Path
+lines = Path('requirements_frozen.txt').read_text(encoding='utf-8').splitlines()
+constraints = [line for line in lines if line.strip() and not line.startswith(('-e ', 'packaging @ ', 'setuptools=='))]
+Path('/tmp/admet-constraints.txt').write_text('\n'.join(constraints) + '\n', encoding='utf-8')
+PY
+
+# 3) CUDA 12.6 PyTorch wheels include the runtime; the host supplies the NVIDIA driver.
+# Override TORCH_INDEX_URL with https://download.pytorch.org/whl/cpu for a CPU-only image.
+RUN python -m pip install --no-cache-dir "setuptools>=82.0.0" \
+ && python -m pip install --no-cache-dir "torch==2.10.0" --index-url "${TORCH_INDEX_URL}" \
+ && python -m pip install --no-cache-dir -e ".[web]" --constraint /tmp/admet-constraints.txt \
+ && python -m pip check
+
+# 4) CPU inference at build time verifies bundled checkpoints and reference data.
+# The build fails if resources are missing, predictions are non-finite, or output columns differ.
+RUN CUDA_VISIBLE_DEVICES="" python - <<'PY'
+import numpy as np
+import pandas as pd
+from admet_ai import ADMETModel
+from admet_ai.constants import DEFAULT_ADMET_PATH, DEFAULT_MODELS_DIR
+
+checkpoints = sorted(DEFAULT_MODELS_DIR.glob('**/*.pt'))
+assert len(checkpoints) == 10, f'Expected 10 bundled checkpoints, found {len(checkpoints)}'
+model = ADMETModel(num_workers=0)
+assert model.device == 'cpu'
+assert model.num_ensembles == 2
+smiles = ['CCO', 'CC(=O)Oc1ccccc1C(=O)O']
+preds = model.predict(smiles)
+expected = len(pd.read_csv(DEFAULT_ADMET_PATH)) * 2
+assert list(preds.index) == smiles
+assert preds.shape == (len(smiles), expected), preds.shape
+assert np.isfinite(preds.to_numpy(dtype=float)).all()
+print(f'[OK] CPU inference: {len(checkpoints)} checkpoints, {preds.shape[0]} molecules, {preds.shape[1]} properties/percentiles')
+PY
+
+# 5) CLI/API are the default; the web server can be started by overriding CMD.
+EXPOSE 5000
+RUN echo "conda activate admet_ai" >> /root/.bashrc
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "admet_ai"]
+CMD ["python", "-c", "import admet_ai, torch; print('ADMET-AI', admet_ai.__version__); print('PyTorch', torch.__version__, 'CUDA runtime', torch.version.cuda, 'cuda available', torch.cuda.is_available())"]

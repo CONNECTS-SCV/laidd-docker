@@ -1,0 +1,91 @@
+# Self-contained Humatch CPU image: clones the repo, builds ANARCI and downloads all weights at build time.
+# Build without any local context:  docker build -t humatch:laidd - < Dockerfile_humatch
+FROM condaforge/miniforge3:24.3.0-0
+
+# Pinned to known commits for reproducible builds; override with --build-arg HUMATCH_REF=<ref> etc.
+ARG HUMATCH_REPO=https://github.com/oxpig/Humatch.git
+ARG HUMATCH_REF=06205ad50f64b84468fea14eea573a3fce699550
+ARG ANARCI_REPO=https://github.com/oxpig/ANARCI.git
+ARG ANARCI_REF=79f6c575056dedef86cb8f405ebb039197923eec
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_REQUIRE_VIRTUALENV=false
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git wget ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Model repo
+RUN git clone "${HUMATCH_REPO}" /opt/humatch \
+ && git -C /opt/humatch checkout "${HUMATCH_REF}"
+WORKDIR /opt/humatch
+
+# 2) Environment: README "Install" (Python 3.9 + pip install). Editable install so the package resolves
+# trained_models/ and germline_likeness_lookup_arrays/ inside the repo, where step 4 puts the weights.
+# The CNNs are small Keras models with no GPU code path, so the image is CPU only (the Linux tensorflow
+# wheel does not pull CUDA libraries). setup.py only gives tensorflow>=2.17.0; pinned for reproducibility.
+# requests is imported by model.py/germline_likeness.py but missing from install_requires.
+# setup.py pins pip hmmer==3.4.0.0 (3.4.0.2 breaks ANARCI numbering); it also provides
+# hmmbuild/hmmpress/hmmscan on PATH for step 3.
+RUN mamba create -y -n humatch python=3.9 \
+ && mamba clean -afy
+SHELL ["conda", "run", "--no-capture-output", "-n", "humatch", "/bin/bash", "-c"]
+RUN pip install --no-cache-dir "tensorflow==2.17.1" requests -e . \
+ && command -v hmmbuild hmmpress hmmscan
+
+# 3) ANARCI (README recommends the GitHub version). Only `setup.py install` runs its post-install step,
+# which downloads germlines from IMGT and builds the HMMs; `pip install` would skip it. That step prints
+# errors instead of failing, so the build checks the pressed HMM exists. setuptools is held below 70
+# because the script relies on the legacy distutils-style install command.
+# Note: the HMMs reflect the IMGT germline set at build time.
+RUN pip install --no-cache-dir "setuptools<70" \
+ && git clone "${ANARCI_REPO}" /tmp/anarci \
+ && git -C /tmp/anarci checkout "${ANARCI_REF}" \
+ && cd /tmp/anarci \
+ && python setup.py install \
+ && cd / \
+ && rm -rf /tmp/anarci \
+ && python -c "import os, anarci; hmm = os.path.join(anarci.HMM_path, 'ALL.hmm.h3m'); \
+assert os.path.isfile(hmm) and os.path.getsize(hmm) > 0, 'ANARCI HMMs were not built: ' + hmm; print('ANARCI HMMs', hmm)"
+
+# 4) CNN weights (3 .h5) and germline likeness lookup arrays (24 .npy), README "auto downloads".
+# The package downloads these on first run without checking the HTTP status, so a rate-limited
+# response would be saved as a weight file; fetch them here with retries instead.
+# URLs and target paths come from the package itself so the file list is not duplicated.
+RUN python -c "import os; \
+from Humatch.model import model_urls, CNN_WEIGHTS_DIR; \
+from Humatch.germline_likeness import gl_urls, GL_DIR; \
+targets = [(url, os.path.join(CNN_WEIGHTS_DIR, name + '.weights.h5')) for name, url in model_urls.items()] \
+        + [(url, os.path.join(GL_DIR, gene + '.npy')) for gene, url in gl_urls.items()]; \
+open('/tmp/weights.txt', 'w').write(''.join(url + ' ' + dest + chr(10) for url, dest in targets))" \
+ && while read -r url dest; do \
+      wget -nv --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 -O "${dest}" "${url}" || exit 1; \
+    done < /tmp/weights.txt \
+ && rm /tmp/weights.txt
+
+# 5) Offline inference check. Sequences ANARCI cannot number are dropped with only a printed warning,
+# so every example chain is checked explicitly. The first example pair is human (README: no edits
+# suggested), which also checks the CNN weights and lookup arrays load and score correctly.
+RUN python -c "import numpy as np, pandas as pd; \
+from Humatch.align import get_padded_seq, strip_padding_from_seq; \
+from Humatch.utils import CANONICAL_NUMBERING; \
+from Humatch.germline_likeness import vgenes, load_observed_position_AA_freqs; \
+from Humatch.model import load_cnn, HEAVY_WEIGHTS, LIGHT_WEIGHTS, PAIRED_WEIGHTS; \
+assert all(load_observed_position_AA_freqs(g).shape == (200, 20) for g in vgenes); \
+[load_cnn(w, t) for w, t in [(HEAVY_WEIGHTS, 'heavy'), (LIGHT_WEIGHTS, 'light'), (PAIRED_WEIGHTS, 'paired')]]; \
+df = pd.read_csv('data/example.csv'); \
+failed = [s for s in df.heavy.tolist() + df.light.tolist() \
+          if get_padded_seq(strip_padding_from_seq(s)) == '-' * len(CANONICAL_NUMBERING)]; \
+assert not failed, failed; print('ANARCI numbered', 2 * len(df), 'chains')" \
+ && head -n 2 data/example.csv > /tmp/example_one.csv \
+ && Humatch-humanise -i /tmp/example_one.csv --vh_col heavy --vl_col light -o /tmp/example_one_humanised.csv \
+ && python -c "import pandas as pd; out = pd.read_csv('/tmp/example_one_humanised.csv'); \
+print(out.drop(columns=['Humatch_H', 'Humatch_L']).to_string()); \
+assert len(out) == 1 and out.Edit[0] == 0 and out.CNN_P[0] >= 0.95, out" \
+ && rm /tmp/example_one.csv /tmp/example_one_humanised.csv
+
+# Interactive `bash` sources .bashrc, which activates base; switch to the model env instead.
+RUN echo "conda activate humatch" >> /root/.bashrc
+
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "humatch"]
+CMD ["Humatch-humanise", "--help"]

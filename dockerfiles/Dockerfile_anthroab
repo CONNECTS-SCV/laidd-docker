@@ -1,0 +1,60 @@
+# Self-contained AnthroAb CPU image: clones the repo and downloads both VH/VL weights at build time.
+# Build without any local context:  docker build -t anthroab:laidd - < Dockerfile_anthroab
+FROM condaforge/miniforge3:24.3.0-0
+
+# Pinned to a known commit for reproducible builds; override with --build-arg ANTHROAB_REF=<ref>.
+ARG ANTHROAB_REPO=https://github.com/nagarh/AnthroAb.git
+ARG ANTHROAB_REF=f4f7dd1a09a1e0647f9d8af7538ceb916215086a
+# Hugging Face weight commits the image was written against (checked in step 3, not forced).
+ARG VH_REV=3f100238e08c4abc68b64e56399e2b0c1ddb2b1f
+ARG VL_REV=a030227b3fca30aabf8c9272dcc7372f1059b9f1
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_REQUIRE_VIRTUALENV=false \
+    HF_HOME=/opt/huggingface
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Model repo
+RUN git clone "${ANTHROAB_REPO}" /opt/anthroab \
+ && git -C /opt/anthroab checkout "${ANTHROAB_REF}"
+WORKDIR /opt/anthroab
+
+# 2) Environment: same steps as README "Installation" (conda env python=3.10 + pip install -e .)
+RUN mamba create -y -n anthroab python=3.10 \
+ && mamba clean -afy
+SHELL ["conda", "run", "--no-capture-output", "-n", "anthroab", "/bin/bash", "-c"]
+# predict.py never moves the model to CUDA, so inference is always on CPU: the CPU wheel avoids
+# ~2.5GB of unused CUDA libraries. setup.py leaves versions open; transformers is pinned to the
+# version the weights were saved with (config.json transformers_version=4.52.4), because 5.x
+# changes the default load dtype and the checkpoints are stored as float16.
+RUN pip install --no-cache-dir "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu \
+ && pip install --no-cache-dir "transformers==4.52.4" -e .
+
+# 3) VH/VL weights. predict.py loads them by repo id (implicit revision main), so they are fetched
+# from main to get refs/main into the cache; an explicit revision would break the offline load.
+# A differing upstream commit is reported, not fatal. training_args.bin is not used for inference.
+RUN python -c "import os; from huggingface_hub import snapshot_download; \
+expected = {'hemantn/roberta-base-humAb-vh': os.environ['VH_REV'], 'hemantn/roberta-base-humAb-vl': os.environ['VL_REV']}; \
+got = {repo: os.path.basename(snapshot_download(repo, ignore_patterns=['training_args.bin'])) for repo in expected}; \
+print(*[repo + ' ' + got[repo] + (' OK' if got[repo] == rev else ' WARNING: expected ' + rev) for repo, rev in expected.items()], sep=chr(10))"
+ENV HF_HUB_OFFLINE=1
+
+# 4) Offline inference check with the README example. The CLI keeps the input sequence when
+# prediction fails, so the build checks the Python API directly and fails if masks remain.
+RUN python -c "import anthroab; \
+vh = '**QLV*SGVEVKKPGASVKVSCKASGYTFTNYYMYWVRQAPGQGLEWMGGINPSNGGTNFNEKFKNRVTLTTDSSTTTAYMELKSLQFDDTAVYYCARRDYRFDMGFDYWGQGTTVTVSS'; \
+vl = 'DIQMTQSPSSLSASV*DRVTITCRASQSISSYLNWYQQKPGKAPKLLIYSASTLASGVPSRFSGSGSGTDF*LTISSLQPEDFATYYCQQSYSTPRTFGQGTKVEIK'; \
+out_vh = anthroab.predict_masked(vh, 'H'); out_vl = anthroab.predict_masked(vl, 'L'); \
+assert len(out_vh) == len(vh) and '*' not in out_vh, out_vh; \
+assert len(out_vl) == len(vl) and '*' not in out_vl, out_vl; \
+print('VH', out_vh); print('VL', out_vl)" \
+ && anthroab --help > /dev/null
+
+# Interactive `bash` sources .bashrc, which activates base; switch to the model env instead.
+RUN echo "conda activate anthroab" >> /root/.bashrc
+
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "anthroab"]
+CMD ["anthroab", "--help"]

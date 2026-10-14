@@ -1,0 +1,77 @@
+# Self-contained GNINA GPU image: clones and builds OpenBabel, libmolgrid and gnina from source at build time.
+# Build without any local context:  docker build -t gnina:laidd - < Dockerfile_gnina
+# The CNN scoring models are compiled into the gnina binary, so there are no weights to download.
+#
+# CUDA 12.1 matches the libtorch that gnina's CMakeLists.txt fetches (2.4.1+cu121, bundles cuDNN 9);
+# needs host driver >= 525. nvcc is required to build, so this is the devel image.
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+# Pinned to known commits for reproducible builds; override with --build-arg <NAME>_REF=<ref>.
+# OpenBabel: the README asks for the dkoes fork (bond-order fixes missing from 3.1.1 and older).
+# libmolgrid: gnina would otherwise fetch libmolgrid master at build time, so it is installed first, pinned.
+ARG OPENBABEL_REPO=https://github.com/dkoes/openbabel.git
+ARG OPENBABEL_REF=1439c69abcb9107c090a13732c8cd75f971f0a46
+ARG LIBMOLGRID_REPO=https://github.com/gnina/libmolgrid.git
+ARG LIBMOLGRID_REF=e11f058c2ae6baa6483fe0b8ba0f5c0dbc86fc10
+ARG GNINA_REPO=https://github.com/gnina/gnina.git
+ARG GNINA_REF=6fe1ce2bb9c35c8067de9f49bb9169857dfbad70
+# Parallel compile jobs; nvcc on gnina's sources is memory hungry, so lower this if the build is OOM-killed.
+ARG BUILD_JOBS=4
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDACXX=/usr/local/cuda/bin/nvcc
+
+# 1) Build dependencies: the README "Ubuntu 22.04" package list.
+# gnina's CMakeLists.txt needs CMake >= 3.25 (Ubuntu 22.04 ships 3.22); 3.31.x is the line upstream's
+# docker/compat uses and still accepts OpenBabel's old cmake_minimum_required (CMake 4 rejects it).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential git wget ca-certificates libboost-all-dev libeigen3-dev libgoogle-glog-dev \
+      libprotobuf-dev protobuf-compiler libhdf5-dev libatlas-base-dev python3-dev librdkit-dev \
+      python3-numpy python3-pip python3-pytest libjsoncpp-dev zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip3 install --no-cache-dir "cmake==3.31.6"
+
+# 2) OpenBabel 3 (shared libraries only; gnina does not use the Python bindings).
+RUN git clone "${OPENBABEL_REPO}" /opt/openbabel \
+ && git -C /opt/openbabel checkout "${OPENBABEL_REF}" \
+ && cmake -S /opt/openbabel -B /opt/openbabel/build \
+      -DWITH_MAEPARSER=OFF -DWITH_COORDGEN=OFF -DPYTHON_BINDINGS=OFF -DRUN_SWIG=OFF \
+ && cmake --build /opt/openbabel/build -j "${BUILD_JOBS}" \
+ && cmake --install /opt/openbabel/build \
+ && rm -rf /opt/openbabel/build \
+ && ldconfig
+
+# 3) libmolgrid (its CMakeLists.txt already targets all-major GPU architectures).
+RUN git clone "${LIBMOLGRID_REPO}" /opt/libmolgrid \
+ && git -C /opt/libmolgrid checkout "${LIBMOLGRID_REF}" \
+ && cmake -S /opt/libmolgrid -B /opt/libmolgrid/build \
+ && cmake --build /opt/libmolgrid/build -j "${BUILD_JOBS}" \
+ && cmake --install /opt/libmolgrid/build \
+ && rm -rf /opt/libmolgrid/build \
+ && ldconfig
+
+# 4) gnina. CMake downloads libtorch itself and `make install` copies the needed torch/cuDNN libraries
+# to /usr/local/lib/gnina, which the binary finds through its RPATH. The build tree (several GB, incl.
+# the unpacked libtorch) is removed in the same layer; the source checkout stays for test/gnina/data.
+RUN git clone "${GNINA_REPO}" /opt/gnina \
+ && git -C /opt/gnina checkout "${GNINA_REF}" \
+ && cmake -S /opt/gnina -B /opt/gnina/build -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build /opt/gnina/build -j "${BUILD_JOBS}" \
+ && cmake --install /opt/gnina/build \
+ && rm -rf /opt/gnina/build \
+ && ldconfig
+WORKDIR /opt/gnina
+
+# 5) Smoke test: redock the README example (184l) and check the poses carry both the Vina affinity and
+# the CNN scores, which proves the embedded CNN models load. The build host has no GPU, so this runs
+# with --no_gpu on the CPU; GPU use is checked at `docker run --gpus` time.
+RUN gnina --version \
+ && gnina -r test/gnina/data/184l_rec.pdb -l test/gnina/data/184l_lig.sdf \
+      --autobox_ligand test/gnina/data/184l_lig.sdf \
+      --no_gpu --seed 0 --exhaustiveness 2 --num_modes 3 -o /tmp/smoke.sdf \
+ && grep -q "minimizedAffinity" /tmp/smoke.sdf \
+ && grep -q "CNNscore" /tmp/smoke.sdf \
+ && rm /tmp/smoke.sdf
+
+CMD ["gnina", "--version"]

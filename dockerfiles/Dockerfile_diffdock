@@ -1,0 +1,99 @@
+# Self-contained DiffDock (v1.1) GPU image: clones the repo and downloads all weights at build time.
+# Build without any local context:  docker build -t diffdock:laidd - < Dockerfile_diffdock
+#
+# CUDA 11.7 matches the torch 1.13.1+cu117 / PyG wheels pinned in environment.yml; needs host driver >= 515.
+# The devel image is required: openfold (an environment.yml dependency) calls `nvcc -V` and compiles a CUDA
+# kernel in its setup.py.
+FROM nvidia/cuda:11.7.1-devel-ubuntu22.04
+
+# Pinned to a known commit for reproducible builds; override with --build-arg DIFFDOCK_REF=<ref>.
+ARG DIFFDOCK_REPO=https://github.com/gcorso/DiffDock.git
+ARG DIFFDOCK_REF=85c49b60d3e0b0182a59ee43a34a6d7036981284
+# The upstream Dockerfile builds environment.yml with micromamba "latest"; 2.1.0 was latest when that
+# Dockerfile was last fixed (2025-05-02, MAMBA_ROOT_PREFIX for micromamba 2.x).
+ARG MICROMAMBA_VERSION=2.1.0
+# v1.1 score + confidence models (the release default_inference_args.yaml points at).
+ARG DIFFDOCK_MODELS_URL=https://github.com/gcorso/DiffDock/releases/download/v1.1/diffdock_models.zip
+ARG DIFFDOCK_MODELS_SHA256=5a95b6a1555be47ab1d6f0a8ffd25152f7fe32f5956005bb821e13e7a37d4a3d
+# ESMFold (~8.5 GB of extra weights) is only used when a protein is given as a sequence instead of a
+# structure file, so it is off by default; --build-arg WITH_ESMFOLD=true.
+ARG WITH_ESMFOLD=false
+
+# TORCH_HOME: fair-esm loads ESM weights through torch.hub, i.e. from $TORCH_HOME/hub/checkpoints.
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    MAMBA_ROOT_PREFIX=/opt/micromamba \
+    TORCH_HOME=/opt/torch
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential git wget curl bzip2 ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL "https://micro.mamba.pm/api/micromamba/linux-64/${MICROMAMBA_VERSION}" \
+      | tar -xj -C /usr/local bin/micromamba
+
+# 1) Model repo
+RUN git clone "${DIFFDOCK_REPO}" /opt/diffdock \
+ && git -C /opt/diffdock checkout "${DIFFDOCK_REF}"
+WORKDIR /opt/diffdock
+
+# 2) Environment: same step as the upstream Dockerfile. environment.yml keeps openfold in its own pip block
+# because openfold's setup.py imports torch, so the import check also covers the build order.
+RUN micromamba env create -y -f environment.yml \
+ && micromamba clean -afy
+SHELL ["micromamba", "run", "-n", "diffdock", "/bin/bash", "-c"]
+RUN python -c "import torch, torch_geometric, torch_cluster, e3nn, esm, rdkit, prody; \
+assert torch.version.cuda, 'CPU-only torch installed: ' + torch.__version__; \
+print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+# 3) DiffDock weights. inference.py would otherwise download them on first run; default_inference_args.yaml
+# loads them by relative path (./workdir/v1.1/{score,confidence}_model), so they live under the repo root.
+RUN wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+      -O /tmp/diffdock_models.zip "${DIFFDOCK_MODELS_URL}" \
+ && echo "${DIFFDOCK_MODELS_SHA256}  /tmp/diffdock_models.zip" | sha256sum -c - \
+ && mkdir -p workdir/v1.1 \
+ && python -c "import zipfile; zipfile.ZipFile('/tmp/diffdock_models.zip').extractall('workdir/v1.1')" \
+ && rm /tmp/diffdock_models.zip \
+ && test -f workdir/v1.1/score_model/best_ema_inference_epoch_model.pt \
+ && test -f workdir/v1.1/confidence_model/best_model_epoch75.pt
+
+# 4) ESM2 650M, used for the protein embeddings on every run (utils/inference_utils.py). fair-esm downloads
+# without retries, so the files are fetched with wget and then loaded once from the cache.
+RUN mkdir -p "${TORCH_HOME}/hub/checkpoints" \
+ && cd "${TORCH_HOME}/hub/checkpoints" \
+ && wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+      https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t33_650M_UR50D.pt \
+      https://dl.fbaipublicfiles.com/fair-esm/regression/esm2_t33_650M_UR50D-contact-regression.pt \
+ && python -c "import esm; esm.pretrained.esm2_t33_650M_UR50D(); print('ESM2 650M OK')"
+
+# 5) Optional ESMFold weights (see WITH_ESMFOLD). Only downloaded, not loaded: building the 3B model needs
+# more RAM than a typical build host has. The import check proves openfold built correctly.
+RUN if [ "${WITH_ESMFOLD}" = "true" ]; then \
+      cd "${TORCH_HOME}/hub/checkpoints" \
+   && wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+        https://dl.fbaipublicfiles.com/fair-esm/models/esmfold_3B_v1.pt \
+        https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t36_3B_UR50D.pt \
+        https://dl.fbaipublicfiles.com/fair-esm/regression/esm2_t36_3B_UR50D-contact-regression.pt \
+   && python -c "from esm.esmfold.v1.esmfold import ESMFold; print('ESMFold import OK')"; \
+    fi
+
+# 6) SO(3)/torus series caches (upstream Dockerfile step). They are written to and read from the working
+# directory, so inference must run from /opt/diffdock (the WORKDIR); elsewhere they are recomputed.
+RUN python utils/precompute_series.py \
+ && test -f .so3_omegas_array4.npy \
+ && test -f .p.npy
+
+# 7) Smoke test: dock the README example (1a0q) end to end, which loads ESM2, the score and confidence
+# models and writes ranked poses. default_inference_args.yaml overrides CLI flags, so a copy with fewer
+# samples is used. The build host has no GPU, so this runs on the CPU; GPU use is checked at
+# `docker run --gpus` time.
+RUN sed 's/^samples_per_complex: .*/samples_per_complex: 2/' default_inference_args.yaml > /tmp/smoke.yaml \
+ && python -m inference --config /tmp/smoke.yaml \
+      --protein_path data/1a0q/1a0q_protein_processed.pdb \
+      --ligand_description data/1a0q/1a0q_ligand.sdf \
+      --complex_name smoke --out_dir /tmp/smoke \
+ && test -f /tmp/smoke/smoke/rank1.sdf \
+ && test "$(ls /tmp/smoke/smoke/rank*_confidence*.sdf | wc -l)" -eq 2 \
+ && rm -rf /tmp/smoke /tmp/smoke.yaml
+
+ENTRYPOINT ["micromamba", "run", "-n", "diffdock"]
+CMD ["python", "utils/print_device.py"]

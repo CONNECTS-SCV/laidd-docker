@@ -1,0 +1,129 @@
+# syntax=docker/dockerfile:1.7
+# Self-contained ImmuScope GPU image: clones the repo and downloads weights + inference data at build time.
+# Build without any local context:  docker build -t immuscope:laidd - < Dockerfile_immuscope
+FROM condaforge/miniforge3:24.3.0-0
+
+# Pinned to a known commit for reproducible builds; override with --build-arg IMMUSCOPE_REF=<ref>.
+ARG IMMUSCOPE_REPO=https://github.com/shenlongchen/ImmuScope.git
+ARG IMMUSCOPE_REF=53c57a984fdab1f95238596e127ebc0684b81e1f
+# Zenodo record 14810445 (latest version of DOI 10.5281/zenodo.14184201).
+ARG ZENODO_URL=https://zenodo.org/records/14810445/files
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_REQUIRE_VIRTUALENV=false
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git wget ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Model repo
+RUN git clone "${IMMUSCOPE_REPO}" /opt/immuscope \
+ && git -C /opt/immuscope checkout "${IMMUSCOPE_REF}"
+WORKDIR /opt/immuscope
+
+# 2) Environment: README "Installation" steps 2-4 (Python 3.9.19, PyTorch 1.12.1 + cudatoolkit 11.6).
+# requirements.txt pins torch==1.12.1, which the conda install already satisfies.
+#
+# mkl<2024 is required, not cosmetic: the pytorch 1.12.1 conda package declares only `mkl >=2018`,
+# so the solver picks mkl 2024+, where the VTune symbol iJIT_NotifyEvent moved out of libmkl_rt.
+# libtorch_cpu.so (built against the mkl 2022 ABI) then fails to link and `import torch` dies with
+# "undefined symbol: iJIT_NotifyEvent". numpy is pinned here too so the solver does not install
+# numpy 2.x only for pip to downgrade it to the requirements.txt pin on the next layer.
+RUN mamba create -y -n immuscope -c pytorch -c conda-forge \
+      python=3.9.19 pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit=11.6 \
+      "mkl<2024" "numpy==1.24.3" \
+ && mamba clean -afy
+SHELL ["conda", "run", "--no-capture-output", "-n", "immuscope", "/bin/bash", "-c"]
+RUN pip install --no-cache-dir -r requirements.txt \
+ && python -c "import torch, numpy; \
+assert torch.__version__.startswith('1.12.1'), torch.__version__; \
+print('torch', torch.__version__, '| numpy', numpy.__version__, '| mkl ok')"
+
+# 3) Model weights (weights/EL, weights/CD4, weights/IM). configs/*.yaml load them by the relative
+# path `weights`, so they live under the repo root.
+RUN wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+      -O /tmp/weights.tar.gz "${ZENODO_URL}/ImmuScope-weights.tar.gz" \
+ && echo "7a7fe6d1045063e2c35dd06b30464e24  /tmp/weights.tar.gz" | md5sum -c - \
+ && tar -xzf /tmp/weights.tar.gz -C . \
+ && rm /tmp/weights.tar.gz
+
+# 4) Data needed for inference only (the full archive is ~3.1 GB, mostly training sets).
+# Extracted: data/raw (MHC-II pseudo sequences + allele list) and the two benchmark test sets used by
+# main_cd4_epitope_test.py / main_immunogenicity_test.py.
+#
+# The archive layout does NOT match configs/data.yaml or the README (they say data/cd4_datasets/ and
+# data/im_datasets/; the archive has data/train_test_h5py/ and data/imm/). Relative symlinks give
+# data.yaml the paths it expects, so the upstream config and README commands stay unchanged.
+# The training sets (data/train_test_h5py/{sa,ma,ba}_train.h5, 5cv_*) are not extracted; data.yaml
+# paths for them (data/el_datasets/...) would need the same remapping.
+#
+# The 3.1 GB archive lives in a BuildKit cache mount (BuildKit is the default builder in current Docker):
+# it stays out of the image layers, and a failed build resumes (wget -c) instead of downloading again.
+# A checksum mismatch deletes the cached file so the next build fetches a fresh copy.
+RUN --mount=type=cache,target=/var/cache/immuscope-dl \
+    wget -c --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+      -P /var/cache/immuscope-dl "${ZENODO_URL}/ImmuScope-data.tar.gz" \
+ && { echo "a1b7399baae10fb20f33137c4cd08b60  /var/cache/immuscope-dl/ImmuScope-data.tar.gz" | md5sum -c - \
+      || { rm -f /var/cache/immuscope-dl/ImmuScope-data.tar.gz; exit 1; }; } \
+ && tar -xzf /var/cache/immuscope-dl/ImmuScope-data.tar.gz -C . \
+      data/raw data/train_test_h5py/NetMHCIIpan_eval.h5 data/imm/imm_test.h5 \
+ && mkdir -p data/cd4_datasets data/im_datasets \
+ && ln -s ../train_test_h5py/NetMHCIIpan_eval.h5 data/cd4_datasets/NetMHCIIpan_eval.h5 \
+ && ln -s ../imm/imm_test.h5 data/im_datasets/imm_test.h5
+
+# 5) Check that everything configs/data.yaml points to for inference exists and is readable the way
+# SinInstanceBag reads it. Paths come from the yaml itself, so this fails if the symlinks or the
+# archive layout drift. The mhc_names check covers datasets.py's unguarded mhc_embedding_dict[mhc_name]
+# lookup, which would otherwise raise KeyError only at inference time.
+RUN for dir in weights/EL weights/CD4 weights/IM; do \
+      test -n "$(ls -A "${dir}")" || { echo "empty ${dir}"; exit 1; }; \
+    done \
+ && python -c "import os, h5py, torch; \
+from ruamel.yaml import YAML; \
+from ImmuScope.models.ImmuScope import ImmuScope; \
+from ImmuScope.utils.data_utils import get_mhc_name_seq; \
+cnf = YAML(typ='safe').load(open('configs/data.yaml')); \
+seqs = get_mhc_name_seq(cnf['mhc_seq']); \
+assert len(seqs) > 100, len(seqs); \
+assert os.path.getsize(cnf['dataset_id_mhc']) > 0, cnf['dataset_id_mhc']; \
+files = [h5py.File(cnf[key], 'r') for key in ('test', 'test_imm')]; \
+assert all(k in f for f in files for k in ('peptide_embedding', 'mhc_names', 'peptide_contexts', 'labels')); \
+unknown = {m.decode('utf-8') for f in files for m in f['mhc_names'][()]} - set(seqs); \
+assert not unknown, sorted(unknown)[:10]; \
+m = torch.nn.Conv1d(16, 64, 9); x = torch.randn(2, 16, 21, requires_grad=True); \
+m(x).sum().backward(); assert x.grad is not None and torch.isfinite(x.grad).all(); \
+print('MHC pseudo sequences', len(seqs), '| test rows', [len(f['labels']) for f in files], '| conv1d fwd/bwd ok')"
+
+# 6) Inference entry for `docker run ... python /opt/predict.py` (upstream only scores the bundled benchmark).
+# Reads /work/input/peptides.txt ("PEPTIDE ALLELE" per line), averages the weights/IM checkpoints,
+# writes /work/output/predictions.csv.
+COPY <<'PY' /opt/predict.py
+import glob, logging
+import numpy as np, pandas as pd, torch
+from torch.utils.data import DataLoader
+from ruamel.yaml import YAML
+from ImmuScope.utils.data_utils import get_mhc_name_seq, save_mhc_peptide_h5py
+from ImmuScope.datasets.datasets import SinInstanceBag
+from ImmuScope.models.trainer_immunogenicity import Trainer
+from ImmuScope.models.ImmuScope import ImmuScope
+
+rows = [line.split() for line in open("/work/input/peptides.txt") if line.strip()]
+save_mhc_peptide_h5py([(a, p, p, 0) for p, a in rows], "/work/output/query.h5", label_dtype=np.int32)
+cfg = YAML(typ="safe").load(open("configs/ImmuScope-IM.yaml"))
+data = YAML(typ="safe").load(open("configs/data.yaml"))
+loader = DataLoader(SinInstanceBag("/work/output/query.h5", get_mhc_name_seq(data["mhc_seq"])), batch_size=256)
+dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+preds = [
+    Trainer(ImmuScope, model_path=w, device=dev, logger=logging.getLogger(), **cfg["model"]).predict(loader, model_prefix="")[0]
+    for w in sorted(glob.glob("weights/IM/*.pt"))
+]
+pd.DataFrame({"peptide": [r[0] for r in rows], "mhc": [r[1] for r in rows],
+              "immunogenicity": np.mean(preds, axis=0)}).to_csv("/work/output/predictions.csv", index=False)
+print("wrote /work/output/predictions.csv")
+PY
+
+# Interactive `bash` sources .bashrc, which activates base; switch to the model env instead.
+RUN echo "conda activate immuscope" >> /root/.bashrc
+
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "immuscope"]
+CMD ["python", "-c", "import ImmuScope, torch; print(torch.__version__, torch.cuda.is_available())"]

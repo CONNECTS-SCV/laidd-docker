@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1.7
+# Self-contained ABodyBuilder3 GPU image: clones the repo and downloads all weights at build time.
+# Build without any local context:  docker build -t abodybuilder3:gpu - < Dockerfile
+FROM condaforge/miniforge3:24.3.0-0
+
+# Pinned to a known commit for reproducible builds; override with --build-arg ABB3_REF=<ref>.
+ARG ABB3_REPO=https://github.com/Exscientia/abodybuilder3.git
+ARG ABB3_REF=18e4058015a39c5405c08a0d5629cf302627b253
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_REQUIRE_VIRTUALENV=false \
+    HF_HOME=/opt/huggingface
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git wget ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Model repo
+RUN git clone "${ABB3_REPO}" /opt/abodybuilder3 \
+ && git -C /opt/abodybuilder3 checkout "${ABB3_REF}"
+WORKDIR /opt/abodybuilder3
+
+# 2) Environment: same steps as init_conda_venv.sh (GPU branch)
+RUN mamba env create -n abb3 -f environment_gpu.yml \
+ && mamba clean -afy
+SHELL ["conda", "run", "--no-capture-output", "-n", "abb3", "/bin/bash", "-c"]
+RUN pip install --no-cache-dir -e ".[dev]" --constraint pinned-versions.txt
+
+# 3) ABodyBuilder3 weights (README "only require model weights for inference" step).
+# Checkpoints are loaded by relative path (output/...), so they live under the repo root.
+RUN mkdir -p output \
+ && wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+      -O /tmp/output.tar.gz https://zenodo.org/records/11354577/files/output.tar.gz \
+ && tar -xzf /tmp/output.tar.gz -C output/ \
+ && rm /tmp/output.tar.gz
+
+# 4) ProtT5 weights used by language/model.py (ProtT5) for the language-model variant.
+# Only PyTorch weights are needed; skip TF/Flax/ONNX files.
+RUN python -c "from huggingface_hub import snapshot_download; \
+snapshot_download('Rostlab/prot_t5_xl_uniref50', ignore_patterns=['*.h5', '*.msgpack', '*.onnx'])"
+ENV HF_HUB_OFFLINE=1
+
+# 5) Upstream pinned-versions.txt is inconsistent: accelerate==0.32.1 imports
+# split_torch_state_dict_into_shards, which needs huggingface-hub>=0.23, but hub is pinned to 0.20.1.
+# accelerate 0.25.0 matches the transformers 4.36.2 / hub 0.20.1 era. Kept after the weight layers
+# so their build cache is reused. The import check fails the build if the mismatch returns.
+RUN pip install --no-cache-dir "accelerate==0.25.0" \
+ && python -c "from transformers import T5EncoderModel, T5Tokenizer; import accelerate; print('accelerate', accelerate.__version__)"
+
+# 6) Inference entry for `docker run ... python /opt/predict.py` (upstream has no CLI; mirrors notebooks/example.ipynb).
+# Reads /work/input/heavy_light.fasta (heavy record, then light) and writes /work/output/model.pdb.
+COPY <<'PY' /opt/predict.py
+import glob
+from abodybuilder3.utils import string_to_input, add_atom37_to_output, output_to_pdb
+from abodybuilder3.lightning_module import LitABB3
+
+records = open("/work/input/heavy_light.fasta").read().split(">")[1:]
+heavy, light = ["".join(r.splitlines()[1:]).strip() for r in records[:2]]
+ckpt = (glob.glob("output/plddt-loss/best_second_stage.ckpt") or glob.glob("output/*/*.ckpt"))[0]
+model = LitABB3.load_from_checkpoint(ckpt).model.eval()
+inp = string_to_input(heavy=heavy, light=light)
+batch = {k: (v if k in ("single", "pair") else v.unsqueeze(0)) for k, v in inp.items()}
+out = model(batch, batch["aatype"])
+open("/work/output/model.pdb", "w").write(output_to_pdb(add_atom37_to_output(out, inp["aatype"]), inp))
+print("wrote /work/output/model.pdb")
+PY
+
+# Interactive `bash` sources .bashrc, which activates base; switch to the model env instead.
+RUN echo "conda activate abb3" >> /root/.bashrc
+
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "abb3"]
+CMD ["python", "-c", "import abodybuilder3, torch; print(torch.__version__, torch.cuda.is_available())"]

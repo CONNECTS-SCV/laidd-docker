@@ -1,0 +1,59 @@
+# Self-contained MHCflurry GPU image: clones the repo and downloads the presentation weights at build time.
+# Build without any local context:  docker build -t mhcflurry:laidd - < Dockerfile_mhcflurry
+FROM condaforge/miniforge3:24.3.0-0
+
+# Pinned to the 2.3.13 release commit for reproducible builds; override with --build-arg MHCFLURRY_REF=<ref>.
+# MHCFLURRY_VERSION is what the step 5 check expects; change it together with MHCFLURRY_REF.
+ARG MHCFLURRY_REPO=https://github.com/openvax/mhcflurry.git
+ARG MHCFLURRY_REF=5744b647e7099df147c6657e297749164bf35e2f
+ARG MHCFLURRY_VERSION=2.3.13
+# CUDA 12.1 PyTorch wheels (the same CUDA line as the project's docker/Dockerfile.train); needs host driver >= 525.
+# The wheels bundle the CUDA libraries, so no CUDA base image is needed. For a CPU-only image use
+# --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
+
+# MHCFLURRY_DATA_DIR is where `mhcflurry downloads fetch` stores weights (<dir>/<release>/<name>).
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_REQUIRE_VIRTUALENV=false \
+    PYTHONUNBUFFERED=1 \
+    MHCFLURRY_DATA_DIR=/opt/mhcflurry-data
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Model repo
+RUN git clone "${MHCFLURRY_REPO}" /opt/mhcflurry \
+ && git -C /opt/mhcflurry checkout "${MHCFLURRY_REF}"
+WORKDIR /opt/mhcflurry
+
+# 2) Environment: setup.py supports Python 3.10-3.12 and only gives torch>=2.0.0, so torch is installed
+# first from the requested index; the package install then finds it already satisfied.
+RUN mamba create -y -n mhcflurry python=3.11 \
+ && mamba clean -afy
+SHELL ["conda", "run", "--no-capture-output", "-n", "mhcflurry", "/bin/bash", "-c"]
+RUN pip install --no-cache-dir --index-url "${TORCH_INDEX_URL}" "torch>=2.0.0" \
+ && pip install --no-cache-dir . \
+ && pip check \
+ && python -c "import torch; assert torch.version.cuda, 'CPU-only torch installed: ' + torch.__version__; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+# 3) Presentation weights (README "Quick start"); the bundle contains the affinity and processing
+# components too. `downloads fetch` has no retries, and a failed extract leaves a partial directory that
+# makes the next attempt fail, so the data dir is cleared before each of the 5 attempts (60 s apart).
+RUN for attempt in 1 2 3 4 5; do \
+      rm -rf "${MHCFLURRY_DATA_DIR}"; \
+      mhcflurry downloads fetch models_class1_presentation && break; \
+      [ "${attempt}" -lt 5 ] || exit 1; \
+      sleep 60; \
+    done
+
+# 4) docker/smoke.py (the project's own check) runs presentation and affinity predictions with and without
+# flanks and verifies the scores are finite and consistent; it also asserts the installed version.
+# The build host has no GPU, so this runs on the CPU; GPU use is checked at `docker run --gpus` time.
+RUN python docker/smoke.py "${MHCFLURRY_VERSION}"
+
+# Interactive `bash` sources .bashrc, which activates base; switch to the model env instead.
+RUN echo "conda activate mhcflurry" >> /root/.bashrc
+
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "mhcflurry"]
+CMD ["python", "-c", "import mhcflurry, torch; print('mhcflurry', mhcflurry.__version__, 'torch', torch.__version__, 'cuda available', torch.cuda.is_available())"]

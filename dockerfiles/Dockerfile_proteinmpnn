@@ -1,0 +1,50 @@
+# Self-contained ProteinMPNN GPU image: clones the repo (all model weights are tracked in git).
+# Build without any local context:  docker build -t proteinmpnn:laidd - < Dockerfile_proteinmpnn
+FROM condaforge/miniforge3:24.3.0-0
+
+# Pinned to a known commit for reproducible builds; override with --build-arg PROTEINMPNN_REF=<ref>.
+ARG PROTEINMPNN_REPO=https://github.com/dauparas/ProteinMPNN.git
+ARG PROTEINMPNN_REF=8907e6671bfbfc92303b5f79c4b5e6ce47cdef57
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_REQUIRE_VIRTUALENV=false \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Model repo. vanilla/soluble/ca weights (*.pt) are committed in the repo, so no separate download.
+RUN git clone "${PROTEINMPNN_REPO}" /opt/ProteinMPNN \
+ && git -C /opt/ProteinMPNN checkout "${PROTEINMPNN_REF}"
+WORKDIR /opt/ProteinMPNN
+
+# 2) Environment: the README only requires Python, PyTorch and NumPy (no setup.py / requirements.txt).
+RUN mamba create -y -n proteinmpnn python=3.11 pip \
+ && mamba clean -afy
+SHELL ["conda", "run", "--no-capture-output", "-n", "proteinmpnn", "/bin/bash", "-c"]
+
+# CUDA 12.6 wheels. protein_mpnn_run.py calls torch.load() without weights_only; the checkpoints hold
+# only tensors and plain numbers, so the weights_only=True default of torch>=2.6 loads them fine.
+RUN pip install --no-cache-dir "torch==2.6.0" \
+      --index-url https://download.pytorch.org/whl/cu126 \
+ && pip install --no-cache-dir "numpy<3" \
+ && pip check
+
+# 3) Build-time smoke test on CPU (no GPU needed): design 1 sequence for a bundled monomer with the
+# default model, then load every checkpoint to catch missing/corrupt weight files.
+RUN python protein_mpnn_run.py \
+      --pdb_path inputs/PDB_monomers/pdbs/5L33.pdb \
+      --out_folder /tmp/smoke --num_seq_per_target 1 --seed 37 \
+ && test -s /tmp/smoke/seqs/5L33.fa \
+ && python -c "import glob, torch; paths = sorted(glob.glob('*_model_weights/v_48_*.pt')); assert len(paths) == 11, paths; [torch.load(p, map_location='cpu') for p in paths]; print('loaded', len(paths), 'checkpoints')" \
+ && rm -rf /tmp/smoke
+
+# Interactive bash should activate the same environment as container commands.
+RUN echo "conda activate proteinmpnn" >> /root/.bashrc \
+ && mkdir -p /data /results
+ENTRYPOINT ["conda", "run", "--no-capture-output", "-n", "proteinmpnn"]
+CMD ["python", "protein_mpnn_run.py", "--help"]

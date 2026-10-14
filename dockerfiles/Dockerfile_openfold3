@@ -1,0 +1,59 @@
+# Self-contained OpenFold3 GPU image, following the Dockerfile_ab3 workflow.
+# Repository, locked dependencies, default model weights and CCD are included.
+# Build: docker build -t openfold3:laidd - < Dockerfile_openfold3
+FROM ubuntu:22.04
+
+# Pin to the current local checkout; override explicitly to use another revision.
+ARG OPENFOLD3_REPO=https://github.com/aqlaboratory/openfold-3.git
+ARG OPENFOLD3_REF=6569fcc7edd4afd5f887bf924ae0d2f613977763
+ARG PIXI_VERSION=v0.80.0
+ARG CUDA_ARCH_LIST="8.0;8.6;9.0"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    OPENFOLD_CACHE=/root/.openfold3 \
+    KMP_AFFINITY=none \
+    TORCH_CUDA_ARCH_LIST=${CUDA_ARCH_LIST}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl git bzip2 libaio-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# 1) Source: no COPY or local repository build context is required.
+RUN git clone "${OPENFOLD3_REPO}" /opt/openfold3 \
+ && git -C /opt/openfold3 checkout --detach "${OPENFOLD3_REF}"
+WORKDIR /opt/openfold3
+
+# 2) Use the project's CUDA 12 environment and committed lock file.
+# The environment includes CUDA development tools, PyTorch, DeepSpeed and cuEquivariance.
+# CUDA is supplied by Pixi, matching upstream docker/Dockerfile.pixi.
+RUN curl -fSL --retry 5 \
+      "https://github.com/prefix-dev/pixi/releases/download/${PIXI_VERSION}/pixi-x86_64-unknown-linux-musl.tar.gz" \
+      -o /tmp/pixi.tar.gz \
+ && tar -xzf /tmp/pixi.tar.gz -C /usr/local/bin pixi \
+ && rm /tmp/pixi.tar.gz
+
+# GPU detection is bypassed only during installation/activation on a GPU-less builder.
+# The local package is installed in editable mode by pixi.toml.
+RUN CONDA_OVERRIDE_CUDA=12.0 pixi install --frozen -e openfold3-cuda12 \
+ && CONDA_OVERRIDE_CUDA=12.0 pixi shell-hook -e openfold3-cuda12 -s bash > /opt/activate.sh \
+ && mkdir -p .pixi/envs/openfold3-cuda12/caches/triton \
+             .pixi/envs/openfold3-cuda12/caches/torch_extensions
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# 3) Download the default OpenBind-0 checkpoint and Biotite CCD at build time.
+# setup_openfold's non-interactive defaults use /root/.openfold3, matching OPENFOLD_CACHE.
+RUN source /opt/activate.sh \
+ && setup_openfold --non-interactive \
+ && python -c "from pathlib import Path; import torch, openfold3; from biotite.setup_ccd import OUTPUT_CCD; from openfold3.entry_points.parameters import DEFAULT_CHECKPOINT_NAME, OPENFOLD_MODEL_CHECKPOINT_REGISTRY; p = Path('/root/.openfold3') / OPENFOLD_MODEL_CHECKPOINT_REGISTRY[DEFAULT_CHECKPOINT_NAME].file_name; assert p.is_file() and p.stat().st_size > 0, p; assert Path(OUTPUT_CCD).is_file(), OUTPUT_CCD; print('checkpoint:', p); print('torch:', torch.__version__, 'CUDA build:', torch.version.cuda); assert torch.version.cuda is not None" \
+ && run_openfold predict --help > /dev/null
+
+# 4) Activate all Pixi environment variables for commands and interactive shells.
+# CUDA kernels compile for the actual GPU on first use; a GPU is not required to build.
+RUN echo 'source /opt/activate.sh' >> /root/.bashrc
+
+ENTRYPOINT ["/bin/bash", "-c", "source /opt/activate.sh && exec \"$@\"", "--"]
+CMD ["python", "-c", "import torch, openfold3; print('torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'GPU available:', torch.cuda.is_available())"]
