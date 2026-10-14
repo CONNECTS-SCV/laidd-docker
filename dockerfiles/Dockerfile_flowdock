@@ -47,8 +47,18 @@ RUN sed -n '/^  - pip:/,$p' environments/flowdock_environment_docker.yaml \
  && rm /tmp/flowdock_pip.txt
 
 # 4) FlowDock weights (README "pretrained FlowDock weights" step); extracts to checkpoints/ in the repo root.
-RUN wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
-      -O /tmp/flowdock_checkpoints.tar.gz https://zenodo.org/records/15066450/files/flowdock_checkpoints.tar.gz \
+# The 2.9 GB archive is checked against Zenodo's md5: a slow transfer once came back full-size but corrupt
+# (gzip "format violated"), so a mismatch deletes the file and downloads again (3 attempts).
+ARG FLOWDOCK_CKPT_MD5=a19bbf4d49f20af5f94303c9370f9dee
+RUN for attempt in 1 2 3; do \
+      wget --progress=dot:giga --tries=5 --waitretry=60 --retry-on-http-error=429,502,503,504 \
+        -O /tmp/flowdock_checkpoints.tar.gz https://zenodo.org/records/15066450/files/flowdock_checkpoints.tar.gz \
+      && echo "${FLOWDOCK_CKPT_MD5}  /tmp/flowdock_checkpoints.tar.gz" | md5sum -c - \
+      && break; \
+      echo "flowdock_checkpoints.tar.gz: download or checksum failed (attempt ${attempt}/3)"; \
+      rm -f /tmp/flowdock_checkpoints.tar.gz; \
+      if [ "${attempt}" = 3 ]; then exit 1; fi; \
+    done \
  && tar -xzf /tmp/flowdock_checkpoints.tar.gz -C /opt/flowdock \
  && rm /tmp/flowdock_checkpoints.tar.gz \
  && test -f checkpoints/esmfold_prior_paper_weights-EMA.ckpt
