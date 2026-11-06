@@ -51,16 +51,25 @@ RUN pip install --no-cache-dir "accelerate==0.25.0" \
 # Reads /work/input/heavy_light.fasta (heavy record, then light) and writes /work/output/model.pdb.
 COPY <<'PY' /opt/predict.py
 import glob
+import torch
 from abodybuilder3.utils import string_to_input, add_atom37_to_output, output_to_pdb
 from abodybuilder3.lightning_module import LitABB3
+
+# The checkpoint restores onto the device it was saved from (cuda) while string_to_input
+# builds CPU tensors; without map_location/.to() the forward pass dies on a device mismatch.
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 records = open("/work/input/heavy_light.fasta").read().split(">")[1:]
 heavy, light = ["".join(r.splitlines()[1:]).strip() for r in records[:2]]
 ckpt = (glob.glob("output/plddt-loss/best_second_stage.ckpt") or glob.glob("output/*/*.ckpt"))[0]
-model = LitABB3.load_from_checkpoint(ckpt).model.eval()
+model = LitABB3.load_from_checkpoint(ckpt, map_location=device).model.eval().to(device)
 inp = string_to_input(heavy=heavy, light=light)
+inp = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in inp.items()}
 batch = {k: (v if k in ("single", "pair") else v.unsqueeze(0)) for k, v in inp.items()}
-out = model(batch, batch["aatype"])
+with torch.no_grad():
+    out = model(batch, batch["aatype"])
+to_cpu = lambda d: {k: (v.cpu() if torch.is_tensor(v) else v) for k, v in d.items()}
+out, inp = to_cpu(out), to_cpu(inp)
 open("/work/output/model.pdb", "w").write(output_to_pdb(add_atom37_to_output(out, inp["aatype"]), inp))
 print("wrote /work/output/model.pdb")
 PY
